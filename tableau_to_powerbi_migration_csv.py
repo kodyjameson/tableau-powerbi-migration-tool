@@ -2,8 +2,9 @@ import os
 import re
 import csv
 import zipfile
-import shutil
+import time
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
 from collections import defaultdict, Counter
 
 OUTPUT_FOLDER = "tableau_migration_csv_output"
@@ -59,6 +60,13 @@ def safe_folder_name(path):
     return name.strip("_") or "tableau_workbook"
 
 
+def make_unique_folder(folder_path):
+    if not os.path.exists(folder_path):
+        return folder_path
+
+    return folder_path + "_" + str(int(time.time()))
+
+
 def extract_twb(input_file):
     if input_file.lower().endswith(".twb"):
         return input_file
@@ -66,10 +74,7 @@ def extract_twb(input_file):
     if not input_file.lower().endswith(".twbx"):
         raise Exception("Input must be a .twb or .twbx file.")
 
-    extract_folder = "extracted_twbx_temp"
-
-    if os.path.exists(extract_folder):
-        shutil.rmtree(extract_folder)
+    extract_folder = "extracted_twbx_temp_" + str(int(time.time()))
 
     os.makedirs(extract_folder)
 
@@ -101,6 +106,197 @@ def complexity_label(score):
     return "High"
 
 
+def safe_xml_text(value):
+    if value is None:
+        value = ""
+
+    value = str(value)
+
+    cleaned = []
+
+    for char in value:
+        code = ord(char)
+
+        if code in (9, 10, 13) or code >= 32:
+            cleaned.append(char)
+
+    return escape("".join(cleaned))
+
+
+def friendly_formula(formula, calc_lookup):
+    if not formula:
+        return ""
+
+    friendly = formula
+
+    matches = re.findall(r"\[Calculation_[^\]]+\]", formula)
+
+    for match in matches:
+        internal_name = clean(match)
+
+        if internal_name in calc_lookup:
+            friendly_name = calc_lookup[internal_name][0]
+            friendly = friendly.replace(match, "[" + friendly_name + "]")
+
+    return friendly
+
+
+def make_excel_workbook_from_csvs(csv_folder, output_xlsx):
+    csv_files = []
+
+    for filename in os.listdir(csv_folder):
+        if filename.lower().endswith(".csv"):
+            csv_files.append(filename)
+
+    csv_files.sort()
+
+    if not csv_files:
+        print("No CSV files found to combine.")
+        return
+
+    def col_letter(col_num):
+        letters = ""
+
+        while col_num:
+            col_num, remainder = divmod(col_num - 1, 26)
+            letters = chr(65 + remainder) + letters
+
+        return letters
+
+    def safe_sheet_name(filename, used_names):
+        name = filename.replace(".csv", "")
+        name = re.sub(r"^\d+_", "", name)
+        name = re.sub(r"[^A-Za-z0-9 _-]", "", name)
+        name = name.replace("_", " ").strip()
+
+        if not name:
+            name = "Sheet"
+
+        name = name[:31]
+
+        original = name
+        counter = 1
+
+        while name in used_names:
+            suffix = " " + str(counter)
+            name = original[:31 - len(suffix)] + suffix
+            counter += 1
+
+        used_names.add(name)
+        return name
+
+    def sheet_xml_from_csv(csv_path):
+        rows_xml = []
+
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+
+            for row_index, row in enumerate(reader, start=1):
+                cells_xml = []
+
+                for col_index, value in enumerate(row, start=1):
+                    cell_ref = col_letter(col_index) + str(row_index)
+                    value = safe_xml_text(value)
+
+                    cell_xml = (
+                        '<c r="' + cell_ref + '" t="inlineStr">'
+                        '<is><t>' + value + '</t></is>'
+                        '</c>'
+                    )
+
+                    cells_xml.append(cell_xml)
+
+                rows_xml.append(
+                    '<row r="' + str(row_index) + '">' +
+                    "".join(cells_xml) +
+                    '</row>'
+                )
+
+        return (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetData>' +
+            "".join(rows_xml) +
+            '</sheetData>'
+            '</worksheet>'
+        )
+
+    used_names = set()
+    sheet_names = []
+
+    for filename in csv_files:
+        sheet_names.append(safe_sheet_name(filename, used_names))
+
+    workbook_sheets_xml = []
+
+    for index, sheet_name in enumerate(sheet_names, start=1):
+        workbook_sheets_xml.append(
+            '<sheet name="' + safe_xml_text(sheet_name) + '" sheetId="' + str(index) +
+            '" r:id="rId' + str(index) + '"/>'
+        )
+
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets>' +
+        "".join(workbook_sheets_xml) +
+        '</sheets>'
+        '</workbook>'
+    )
+
+    workbook_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    )
+
+    for index in range(1, len(csv_files) + 1):
+        workbook_rels_xml += (
+            '<Relationship Id="rId' + str(index) + '" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            'Target="worksheets/sheet' + str(index) + '.xml"/>'
+        )
+
+    workbook_rels_xml += '</Relationships>'
+
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+    )
+
+    for index in range(1, len(csv_files) + 1):
+        content_types_xml += (
+            '<Override PartName="/xl/worksheets/sheet' + str(index) + '.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        )
+
+    content_types_xml += '</Types>'
+
+    root_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+
+    with zipfile.ZipFile(output_xlsx, "w", zipfile.ZIP_DEFLATED) as xlsx:
+        xlsx.writestr("[Content_Types].xml", content_types_xml)
+        xlsx.writestr("_rels/.rels", root_rels_xml)
+        xlsx.writestr("xl/workbook.xml", workbook_xml)
+        xlsx.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+
+        for index, filename in enumerate(csv_files, start=1):
+            csv_path = os.path.join(csv_folder, filename)
+            sheet_xml = sheet_xml_from_csv(csv_path)
+            xlsx.writestr("xl/worksheets/sheet" + str(index) + ".xml", sheet_xml)
+
+
 def main():
     input_file = input(
         "Drag the Tableau .twb or .twbx file here, then press Enter:\n"
@@ -113,9 +309,7 @@ def main():
 
     workbook_name = safe_folder_name(input_file)
     output_folder = os.path.join(OUTPUT_FOLDER, workbook_name)
-
-    if os.path.exists(output_folder):
-        shutil.rmtree(output_folder)
+    output_folder = make_unique_folder(output_folder)
 
     os.makedirs(output_folder)
 
@@ -141,7 +335,6 @@ def main():
     custom_sql = set()
     risks = set()
 
-    # Data sources, fields, calculations, parameters
     for datasource in root.findall(".//datasource"):
         ds_name = datasource.get("caption") or datasource.get("name", "")
 
@@ -176,7 +369,7 @@ def main():
             calc = column.find("calculation")
 
             if calc is not None:
-                formula = calc.get("formula", "")
+                formula = calc.get("formula", "") or ""
                 calc_name = field_name or raw_name
 
                 calc_lookup[raw_name] = (calc_name, formula, ds_name)
@@ -184,12 +377,10 @@ def main():
 
                 calc_rows.append([ds_name, calc_name, formula])
 
-    # Custom SQL
     for relation in root.findall(".//relation"):
         if relation.get("type") == "text" and relation.text:
             custom_sql.add(relation.text.strip())
 
-    # Dashboards and worksheets
     for dashboard in root.findall(".//dashboard"):
         dashboard_name = dashboard.get("name", "")
 
@@ -206,7 +397,6 @@ def main():
                 worksheets.add(worksheet_name)
                 dashboard_map.append([dashboard_name, worksheet_name])
 
-    # Worksheet dependencies
     for worksheet in root.findall(".//worksheet"):
         worksheet_name = worksheet.get("name", "")
 
@@ -240,7 +430,8 @@ def main():
                             "Calculation",
                             calc_name,
                             ds_name,
-                            formula
+                            formula,
+                            friendly_formula(formula, calc_lookup)
                         ])
                     else:
                         roadmap.append([
@@ -248,10 +439,10 @@ def main():
                             "Field",
                             name,
                             field_source.get(name, ""),
+                            "",
                             ""
                         ])
 
-    # Full roadmap with dashboard
     dash_to_ws = defaultdict(set)
 
     for dash, ws_name in dashboard_map:
@@ -259,24 +450,24 @@ def main():
 
     ws_to_deps = defaultdict(list)
 
-    for ws_name, dep_type, dep_name, ds_name, formula in roadmap:
-        ws_to_deps[ws_name].append((dep_type, dep_name, ds_name, formula))
+    for ws_name, dep_type, dep_name, ds_name, formula, friendly in roadmap:
+        ws_to_deps[ws_name].append((dep_type, dep_name, ds_name, formula, friendly))
 
     full_roadmap = []
 
     for dash, ws_set in dash_to_ws.items():
         for ws_name in sorted(ws_set):
-            for dep_type, dep_name, ds_name, formula in ws_to_deps.get(ws_name, []):
+            for dep_type, dep_name, ds_name, formula, friendly in ws_to_deps.get(ws_name, []):
                 full_roadmap.append([
                     dash,
                     ws_name,
                     dep_type,
                     dep_name,
                     ds_name,
-                    formula
+                    formula,
+                    friendly
                 ])
 
-    # Migration summary
     summary_rows = []
 
     for dash, ws_set in dash_to_ws.items():
@@ -285,7 +476,7 @@ def main():
         source_set = set()
 
         for ws_name in ws_set:
-            for dep_type, dep_name, ds_name, formula in ws_to_deps.get(ws_name, []):
+            for dep_type, dep_name, ds_name, formula, friendly in ws_to_deps.get(ws_name, []):
                 if ds_name:
                     source_set.add(ds_name)
 
@@ -307,12 +498,10 @@ def main():
             complexity_label(score)
         ])
 
-    # Calculation dependencies
     calc_dep_rows = []
 
     for ds_name, calc_name, formula in calc_rows:
         matches = re.findall(r"\[[^\]]+\]", formula)
-
         used = sorted(set(clean(x) for x in matches if clean(x)))
 
         uses_calcs = []
@@ -320,7 +509,10 @@ def main():
 
         for item in used:
             if item in calc_lookup or item.startswith("Calculation_"):
-                uses_calcs.append(item)
+                if item in calc_lookup:
+                    uses_calcs.append(calc_lookup[item][0])
+                else:
+                    uses_calcs.append(item)
             else:
                 uses_fields.append(item)
 
@@ -328,15 +520,15 @@ def main():
             calc_name,
             ds_name,
             ", ".join(uses_fields),
-            ", ".join(uses_calcs),
-            formula
+            ", ".join(sorted(set(uses_calcs))),
+            formula,
+            friendly_formula(formula, calc_lookup)
         ])
 
-    # Field and calculation usage
     field_counter = Counter()
     calc_counter = Counter()
 
-    for ws_name, dep_type, dep_name, ds_name, formula in roadmap:
+    for ws_name, dep_type, dep_name, ds_name, formula, friendly in roadmap:
         if dep_type == "Field":
             field_counter[dep_name] += 1
 
@@ -360,14 +552,13 @@ def main():
             count
         ])
 
-    # Worksheet complexity
     worksheet_complexity_rows = []
 
     for ws_name, deps in sorted(ws_to_deps.items()):
         fields = set()
         calcs = set()
 
-        for dep_type, dep_name, ds_name, formula in deps:
+        for dep_type, dep_name, ds_name, formula, friendly in deps:
             if dep_type == "Field":
                 fields.add(dep_name)
 
@@ -384,12 +575,11 @@ def main():
             complexity_label(score)
         ])
 
-    # Data source impact
     source_dash = defaultdict(set)
     source_ws = defaultdict(set)
     source_calc = defaultdict(set)
 
-    for dash, ws_name, dep_type, dep_name, ds_name, formula in full_roadmap:
+    for dash, ws_name, dep_type, dep_name, ds_name, formula, friendly in full_roadmap:
         if ds_name:
             source_dash[ds_name].add(dash)
             source_ws[ds_name].add(ws_name)
@@ -407,11 +597,9 @@ def main():
             len(source_calc[ds_name])
         ])
 
-    # Unused field check
     used_fields = set(field_counter.keys())
 
     unused_rows = []
-
     seen_field_rows = set()
 
     for ds_name, field_name, dtype, role in all_fields:
@@ -430,7 +618,6 @@ def main():
             "Yes" if field_name in used_fields else "No"
         ])
 
-    # Migration checklist
     checklist_rows = []
 
     for dash, ws_set in dash_to_ws.items():
@@ -452,18 +639,17 @@ def main():
                 ""
             ])
 
-    # Risks
     for ds_name, calc_name, formula in calc_rows:
         upper_formula = formula.upper()
 
         for pattern, severity in RISK_PATTERNS.items():
             if pattern in upper_formula:
-                risks.add((pattern, severity, calc_name, formula))
+                risks.add((pattern, severity, calc_name, formula, friendly_formula(formula, calc_lookup)))
 
     risk_pattern_counts = Counter()
     risk_severity_counts = Counter()
 
-    for pattern, severity, calc_name, formula in risks:
+    for pattern, severity, calc_name, formula, friendly in risks:
         risk_pattern_counts[pattern] += 1
         risk_severity_counts[severity] += 1
 
@@ -475,7 +661,6 @@ def main():
     for pattern, count in sorted(risk_pattern_counts.items()):
         risk_summary_rows.append(["Pattern", pattern, count])
 
-    # Power BI build order and translation hints
     build_order_rows = [
         [1, "Confirm data sources", "Identify and connect the required source tables/files."],
         [2, "Load source fields", "Bring in all required fields used by the Tableau workbook."],
@@ -519,7 +704,16 @@ def main():
         ["Roadmap Rows", len(full_roadmap)]
     ]
 
-    # Write outputs
+    calc_output_rows = []
+
+    for ds_name, calc_name, formula in calc_rows:
+        calc_output_rows.append([
+            ds_name,
+            calc_name,
+            formula,
+            friendly_formula(formula, calc_lookup)
+        ])
+
     write_csv(
         output_folder,
         "00_workbook_summary.csv",
@@ -544,21 +738,21 @@ def main():
     write_csv(
         output_folder,
         "03_migration_roadmap.csv",
-        ["Dashboard", "Worksheet", "Dependency Type", "Dependency Name", "Data Source", "Formula"],
+        ["Dashboard", "Worksheet", "Dependency Type", "Dependency Name", "Data Source", "Original Formula", "Friendly Formula"],
         full_roadmap
     )
 
     write_csv(
         output_folder,
         "04_calculation_dictionary.csv",
-        ["Data Source", "Calculation Name", "Formula"],
-        calc_rows
+        ["Data Source", "Calculation Name", "Original Formula", "Friendly Formula"],
+        calc_output_rows
     )
 
     write_csv(
         output_folder,
         "05_calculation_dependencies.csv",
-        ["Calculation", "Data Source", "Uses Fields", "Uses Calculations", "Formula"],
+        ["Calculation", "Data Source", "Uses Fields", "Uses Calculations", "Original Formula", "Friendly Formula"],
         calc_dep_rows
     )
 
@@ -621,7 +815,7 @@ def main():
     write_csv(
         output_folder,
         "14_migration_risks.csv",
-        ["Risk Pattern", "Severity", "Calculation", "Formula"],
+        ["Risk Pattern", "Severity", "Calculation", "Original Formula", "Friendly Formula"],
         [list(x) for x in sorted(risks)]
     )
 
@@ -653,11 +847,17 @@ def main():
         checklist_rows
     )
 
+    excel_output = os.path.join(output_folder, "Tableau_Migration_Package.xlsx")
+    make_excel_workbook_from_csvs(output_folder, excel_output)
+
     print("")
-    print("CSV migration package created:")
+    print("Migration package created:")
     print(output_folder)
     print("")
-    print("Open the folder and review the CSV files in Excel.")
+    print("Combined Excel workbook created:")
+    print(excel_output)
+    print("")
+    print("Open the Excel workbook to review the CSV outputs as separate tabs.")
 
 
 if __name__ == "__main__":
